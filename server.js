@@ -5,7 +5,7 @@ const PORT = process.env.PORT || 10000;
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Spines WebSocket Server Running ✅\n');
+  res.end('Spines WebSocket Server Running ✅ - Different Networks Fixed\n');
 });
 
 const wss = new WebSocket.Server({ server });
@@ -14,19 +14,14 @@ let rooms = {}; // room_code => [{id, name, isHost, wantsToSpeak, ws}]
 
 function broadcastPresence(roomCode) {
   if (!rooms[roomCode]) return;
-  // Remove dead sockets
   rooms[roomCode] = rooms[roomCode].filter(u => u.ws && u.ws.readyState === 1);
 
-  // DEDUP: remove duplicate by id and name
+  // DEDUP by ID only - usifukuze watu wa jina sawa
   let unique = [];
   let seenId = new Set();
-  let seenName = new Set();
   rooms[roomCode].forEach(u => {
-    let nameKey = (u.name || '').toLowerCase().trim();
     if (seenId.has(u.id)) return;
-    if (!u.isHost && nameKey && seenName.has(nameKey)) return;
     seenId.add(u.id);
-    if (nameKey) seenName.add(nameKey);
     unique.push(u);
   });
   rooms[roomCode] = unique;
@@ -38,15 +33,9 @@ function broadcastPresence(roomCode) {
     wantsToSpeak: u.wantsToSpeak || 0
   }));
 
-  let payload = JSON.stringify({
-    type: 'presence',
-    users: usersList
-  });
-
+  let payload = JSON.stringify({ type: 'presence', users: usersList });
   rooms[roomCode].forEach(u => {
-    try {
-      if (u.ws.readyState === 1) u.ws.send(payload);
-    } catch (e) {}
+    try { if (u.ws.readyState === 1) u.ws.send(payload); } catch {}
   });
   console.log(`[${roomCode}] Presence: ${usersList.length} users`);
 }
@@ -64,24 +53,17 @@ wss.on('connection', (ws) => {
       currentRoom = room;
       if (!rooms[room]) rooms[room] = [];
 
+      // PING - keep alive for Render free tier (muhimu!)
+      if (data.type === 'ping') {
+        try { ws.send(JSON.stringify({ type: 'pong' })); } catch {}
+        return;
+      }
+
       // JOIN
       if (data.type === 'join') {
         currentId = data.user_id;
         console.log(`JOIN ${room} - ${data.name} ID:${data.user_id} Host:${data.is_host}`);
-
-        // Remove old entry with same ID or same name (fix double entry)
-        rooms[room] = rooms[room].filter(u => {
-          if (u.id === data.user_id) return false;
-          if (!data.is_host &&!u.isHost && u.name && data.name) {
-            if (u.name.toLowerCase().trim() === data.name.toLowerCase().trim()) {
-              try { u.ws.close(); } catch {}
-              return false;
-            }
-          }
-          return true;
-        });
-
-        // Add new
+        rooms[room] = rooms[room].filter(u => u.id!== data.user_id);
         rooms[room].push({
           id: data.user_id,
           name: data.name || 'User',
@@ -89,7 +71,6 @@ wss.on('connection', (ws) => {
           wantsToSpeak: 0,
           ws: ws
         });
-
         broadcastPresence(room);
       }
 
@@ -99,119 +80,122 @@ wss.on('connection', (ws) => {
         if (rooms[room]) {
           rooms[room] = rooms[room].filter(u => u.id!== data.user_id);
           broadcastPresence(room);
+        }
+      }
 
-          // Notify others
-          let leaveMsg = JSON.stringify({
-            type: 'leave',
-            user_id: data.user_id,
-            name: data.name || 'User'
-          });
+      // CHAT - ulisahau hii boss!
+      if (data.type === 'chat') {
+        if (rooms[room]) {
+          let payload = JSON.stringify(data);
           rooms[room].forEach(u => {
-            try { if (u.ws.readyState === 1) u.ws.send(leaveMsg); } catch {}
+            try { if (u.ws.readyState === 1) u.ws.send(payload); } catch {}
           });
         }
       }
 
-      // REQUEST MIC
+      // PRIVATE CHAT - ulisahau hii pia!
+      if (data.type === 'private_chat') {
+        if (rooms[room]) {
+          let target = rooms[room].find(u => u.id === data.to_id || u.id === parseInt(data.to_id));
+          if (target && target.ws.readyState === 1) {
+            try { target.ws.send(JSON.stringify(data)); } catch {}
+          }
+          // also send back to sender for confirmation
+          let sender = rooms[room].find(u => u.id === data.from_id);
+          if (sender && sender.id!== data.to_id) {
+            // optional
+          }
+        }
+      }
+
+      // REQUEST MIC - join.php inatuma request_mic
+      if (data.type === 'request_mic') {
+        console.log(`REQUEST MIC ${room} from ${data.name}`);
+        if (rooms[room]) {
+          // notify all hosts
+          rooms[room].forEach(u => {
+            if (u.isHost) {
+              try { u.ws.send(JSON.stringify(data)); } catch {}
+            }
+          });
+        }
+      }
+
+      // MIC GRANTED
+      if (data.type === 'mic_granted') {
+        console.log(`MIC GRANTED ${room} to ${data.to_id}`);
+        if (rooms[room]) {
+          let target = rooms[room].find(u => u.id === data.to_id || u.id === parseInt(data.to_id));
+          if (target && target.ws.readyState === 1) {
+            try { target.ws.send(JSON.stringify(data)); } catch {}
+          }
+        }
+      }
+
+      // REQUEST (old)
       if (data.type === 'request') {
-        console.log(`REQUEST ${room} from ${data.name} ID:${data.user_id}`);
         if (rooms[room]) {
           let user = rooms[room].find(u => u.id === data.user_id);
           if (user) user.wantsToSpeak = 1;
-          // Notify host
           rooms[room].forEach(u => {
-            if (u.isHost) {
-              try { u.ws.send(JSON.stringify({ type: 'request', user_id: data.user_id, name: data.name })); } catch {}
-            }
+            if (u.isHost) { try { u.ws.send(JSON.stringify(data)); } catch {} }
           });
           broadcastPresence(room);
         }
       }
 
-      // ALLOW - mtu 1 tu!
-      if (data.type === 'allow') {
-        console.log(`ALLOW ${room} target:${data.target_id}`);
+      if (data.type === 'allow' || data.type === 'approved') {
         if (rooms[room]) {
           let target = rooms[room].find(u => u.id === data.target_id);
           if (target) target.wantsToSpeak = 2;
-          // Send ONLY to target
           rooms[room].forEach(u => {
-            if (u.id === data.target_id) {
-              try { u.ws.send(JSON.stringify({ type: 'approved', target_id: data.target_id })); } catch {}
-            }
+            if (u.id === data.target_id) { try { u.ws.send(JSON.stringify(data)); } catch {} }
           });
           broadcastPresence(room);
         }
       }
 
-      // FORCE MUTE - mtu 1 tu
       if (data.type === 'force_mute') {
-        console.log(`FORCE MUTE ${room} target:${data.target_id}`);
         if (rooms[room]) {
           let target = rooms[room].find(u => u.id === data.target_id);
           if (target) target.wantsToSpeak = 0;
           rooms[room].forEach(u => {
-            if (u.id === data.target_id) {
-              try { u.ws.send(JSON.stringify({ type: 'force_mute', target_id: data.target_id })); } catch {}
-            }
+            if (u.id === data.target_id) { try { u.ws.send(JSON.stringify(data)); } catch {} }
           });
           broadcastPresence(room);
         }
       }
 
-      // MUTE ALL
       if (data.type === 'mute_all') {
-        console.log(`MUTE ALL ${room}`);
         if (rooms[room]) {
           rooms[room].forEach(u => {
             if (!u.isHost) {
               u.wantsToSpeak = 0;
-              try { u.ws.send(JSON.stringify({ type: 'mute_all' })); } catch {}
-              try { u.ws.send(JSON.stringify({ type: 'force_mute', target_id: u.id })); } catch {}
+              try { u.ws.send(JSON.stringify(data)); } catch {}
             }
           });
           broadcastPresence(room);
         }
       }
 
-      // SIGNAL - WebRTC (p2p)
+      // SIGNAL - WebRTC (muhimu kwa different networks)
       if (data.type === 'signal') {
         if (rooms[room]) {
-          let target = rooms[room].find(u => u.id === data.target_id);
-          if (target && target.ws.readyState === 1) {
+          let target = rooms[room].find(u => u.id === data.target_id || u.id === parseInt(data.target_id));
+          if (target && target.ws && target.ws.readyState === 1) {
             try { target.ws.send(JSON.stringify(data)); } catch {}
-          } else if (data.target_id === 1) {
-            // If target is host but not found by ID 1, find host
-            let host = rooms[room].find(u => u.isHost);
-            if (host && host.ws.readyState === 1) {
-              try { host.ws.send(JSON.stringify(data)); } catch {}
-            }
+          } else {
+            // fallback: broadcast to all except sender if target not found
+            rooms[room].forEach(u => {
+              if (u.id!== data.from && u.ws.readyState === 1) {
+                try { u.ws.send(JSON.stringify(data)); } catch {}
+              }
+            });
           }
         }
       }
 
-      // SCREEN SIGNAL
-      if (data.type === 'screen_signal') {
-        if (rooms[room]) {
-          let target = rooms[room].find(u => u.id === data.target_id);
-          if (target && target.ws.readyState === 1) {
-            try { target.ws.send(JSON.stringify(data)); } catch {}
-          }
-        }
-      }
-
-      // EMOJI
-      if (data.type === 'emoji') {
-        if (rooms[room]) {
-          let emojiMsg = JSON.stringify(data);
-          rooms[room].forEach(u => {
-            try { if (u.ws.readyState === 1) u.ws.send(emojiMsg); } catch {}
-          });
-        }
-      }
-
-      // SCREEN SHARE STATUS
-      if (data.type === 'screen_share') {
+      if (data.type === 'screen_signal' || data.type === 'screen_share' || data.type === 'emoji') {
         if (rooms[room]) {
           let msg = JSON.stringify(data);
           rooms[room].forEach(u => {
@@ -220,27 +204,21 @@ wss.on('connection', (ws) => {
         }
       }
 
-      // END MEETING
       if (data.type === 'end_meeting') {
         console.log(`END MEETING ${room}`);
         if (rooms[room]) {
           let endMsg = JSON.stringify({ type: 'meeting_ended' });
-          rooms[room].forEach(u => {
-            try { if (u.ws.readyState === 1) u.ws.send(endMsg); } catch {}
-          });
+          rooms[room].forEach(u => { try { if (u.ws.readyState === 1) u.ws.send(endMsg); } catch {} });
           delete rooms[room];
         }
       }
 
-    } catch (e) {
-      console.log('Error:', e.message);
-    }
+    } catch (e) { console.log('Error:', e.message); }
   });
 
   ws.on('close', () => {
     console.log('Client disconnected');
     if (currentRoom && rooms[currentRoom]) {
-      // Delay cleanup 3 sec - if user refreshes quickly don't remove
       setTimeout(() => {
         if (rooms[currentRoom]) {
           let before = rooms[currentRoom].length;
@@ -250,15 +228,11 @@ wss.on('connection', (ws) => {
             broadcastPresence(currentRoom);
           }
         }
-      }, 3000);
+      }, 2000);
     }
   });
 
-  ws.on('error', (err) => {
-    console.log('WS error', err.message);
-  });
+  ws.on('error', (err) => { console.log('WS error', err.message); });
 });
 
-server.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
-});
+server.listen(PORT, () => { console.log(`✅ Server running on port ${PORT}`); });
